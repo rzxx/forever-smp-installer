@@ -1,7 +1,11 @@
 name: Check installer
 on:
   push:
+    branches: [main]
   pull_request:
+concurrency:
+  group: installer-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
