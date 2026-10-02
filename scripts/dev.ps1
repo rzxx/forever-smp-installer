@@ -8,6 +8,7 @@ $ErrorActionPreference = 'Stop'
 $sourceRoot = Split-Path -Parent $PSScriptRoot
 $previousFxcPath = $env:GPUI_FXC_PATH
 $previousDataDirectory = $env:FOREVER_SMP_DATA_DIR
+if (-not $BuildOnly) { $PackRoot = (Resolve-Path -LiteralPath $PackRoot).Path }
 Push-Location $sourceRoot
 try {
     . (Join-Path $PSScriptRoot 'windows-build.ps1')
@@ -18,7 +19,6 @@ try {
     $executable = Join-Path $targetDirectory 'debug/forever-smp.exe'
     if ($BuildOnly) { Write-Host "Built current source: $executable"; return }
 
-    $PackRoot = (Resolve-Path -LiteralPath $PackRoot).Path
     if ($BuildPack) { & (Join-Path $PackRoot 'scripts/build.ps1') }
     $line = Get-Content -LiteralPath (Join-Path $PackRoot 'pack.toml') |
         Where-Object { $_ -match '^version = "([^"]+)"$' } | Select-Object -First 1
