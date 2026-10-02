@@ -1,19 +1,45 @@
 # Forever SMP Setup
 
-Minimal Windows setup and updater for Forever SMP. Russian and English UI.
+Windows installer and updater, with English and Russian UI. This repository contains its source and the existing signed release channel.
 
-[Download the Windows setup](https://github.com/rzxx/forever-smp-installer/releases/latest) · [Minecraft pack / MRPack](https://github.com/rzxx/forever-smp-releases/releases/latest)
+[Download the installer](https://github.com/rzxx/forever-smp-installer/releases/latest) · [Modpack source and downloads](https://github.com/rzxx/forever-smp-releases)
 
-Extract the ZIP into a writable folder, run Forever-SMP.exe and select your Minecraft game folder. Use the recommended mods or customise optional choices. Your launcher handles Minecraft, Fabric, Java and accounts.
+Extract the ZIP into a writable folder and run `Forever-SMP.exe`. Your launcher handles Minecraft, Fabric, Java and accounts. Close Minecraft before updating. The app remembers your game folder, optional mods and personal settings; app and pack updates are reviewed together. Server access is arranged privately with the owner.
 
-Later, close Minecraft and open the same app. App and pack updates are checked together with one confirmation. App restart and continuation are automatic. Saved language, game folder, mod choices and personal configs are preserved. Apps older than 0.1.7 need one manual download to enable self-updates.
+Распакуйте ZIP и запустите `Forever-SMP.exe`. Minecraft, Fabric, Java и учётные записи настраивает лаунчер. Перед обновлением закройте Minecraft. Приложение сохраняет папку игры, выбранные моды и личные настройки.
 
-Server access is arranged privately with the owner. This public repository contains reviewed app downloads and documentation; it contains no server address, invitation password, world, host configuration or private workspace source. Installer and pack releases are independent. Windows x64 only at present.
+## Develop
 
-## Русский
+Use Windows x64, PowerShell 7, Rust, MSVC C++ build tools and the Windows SDK. Scripts find the SDK shader compiler used by GPUI. Dependencies are pinned in `Cargo.lock`.
 
-Распакуйте ZIP в отдельную папку с правом записи и запустите Forever-SMP.exe. Выберите папку игры и рекомендуемую сборку или настройте необязательные моды. Minecraft, Fabric, Java и учётную запись настраивает лаунчер.
+Clone the existing pack repository beside this checkout for local UI testing:
 
-Для обновления закройте Minecraft и откройте то же приложение. Обновления приложения и сборки подтверждаются вместе: перезапуск и завершение происходят автоматически. Язык, папка игры, выбранные моды и личные настройки сохраняются. Для версий старше 0.1.7 один раз скачайте новую версию, чтобы включить самообновление.
+```powershell
+git clone https://github.com/rzxx/forever-smp-installer installer
+git clone https://github.com/rzxx/forever-smp-releases modpack
+./installer/scripts/dev.ps1 -BuildPack
+```
 
-Доступ на сервер получите лично у владельца. В репозитории только публичные файлы приложения; данные сервера и исходники частного рабочего проекта не публикуются.
+After that, run `./scripts/dev.ps1` from this repo for each installer iteration. It rebuilds and opens `target/debug/forever-smp.exe`, reads a local recipe from the pack checkout, and uses `dist/dev/profile` plus an initially empty `dist/dev/game`. No invitation or signing key is needed. Local mode disables installer self-updates. Keep game-folder selections inside disposable test folders.
+
+Use `-BuildPack` after changing the modpack, `-PackRoot <checkout>` for another pack checkout, or `-BuildOnly` to compile without opening the app. A raw `cargo build` only compiles; it does not prepare a test profile or package a release.
+
+```powershell
+./scripts/test.ps1 -Handoff  # unit/GPUI tests, clippy, Windows replacement and rollback
+./scripts/build-app.ps1     # unsigned release candidate in dist/releases/<app-version>
+```
+
+The handoff fixture has its own public test key and never uses production signing keys. [Release steps](docs/releases.md) describe signing and publishing separately. Builds and tests never publish or deploy.
+
+## Source
+
+| Path | Owns |
+| --- | --- |
+| `app/core` | Pack planning, file transactions, signature checks, app replacement/rollback |
+| `app/desktop` | GPUI wizard, preferences and Forever SMP defaults |
+| `app/release` | Metadata export/signing CLI, also used by the modpack repo |
+| `scripts` | Development, verification and packaging entry points |
+
+The engine is reusable in parts; the desktop app and recipe mapping still contain Forever SMP branding, IDs and trust pins. Adapting it to another pack requires changing those deliberately. Public verification keys belong in source; private signing keys, invitations and live server data do not. Source publication keeps the existing repository names, release URLs, asset filenames and update feeds.
+
+App version lives in workspace `Cargo.toml`, notes in `app-release.toml`. Pack versions are independent. Windows x64 is supported; macOS has not been packaged or verified. Source is MIT licensed; dependencies retain their own licenses.

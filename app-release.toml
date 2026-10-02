@@ -1,0 +1,2 @@
+notes_en = "Confirmed installer staging is cleaned automatically after helpers exit, keeping one previous executable. Game rollback history retains the last three completed updates and one failed transaction. Unfinished and unrecognised data are preserved."
+notes_ru = "После завершения помощника временные файлы подтверждённых обновлений приложения удаляются автоматически; сохраняется одна предыдущая версия. В папке игры остаются последние три завершённых обновления и одна неудачная операция. Незавершённые и неизвестные данные сохраняются."

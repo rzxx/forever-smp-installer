@@ -1,0 +1,18 @@
+[package]
+name = "forever-smp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forever-core = { path = "../core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "windows-manifest"] }
+dirs = "6"
+semver = "1"
+
+[dev-dependencies]
+gpui = { version = "=0.2.2", default-features = false, features = ["test-support", "font-kit", "windows-manifest"] }
+tempfile = "3"

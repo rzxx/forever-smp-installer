@@ -1,0 +1,5 @@
+/dist/
+/target/
+/.private/
+*.private.json
+*-signing-key.txt

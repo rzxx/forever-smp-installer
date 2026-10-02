@@ -1,0 +1,14 @@
+name: Check installer
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test, lint and rehearse executable handoff
+        shell: pwsh
+        run: ./scripts/test.ps1 -Handoff
