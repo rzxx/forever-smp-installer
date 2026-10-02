@@ -26,6 +26,7 @@ notes_ru = "Изолированная проверка обновления Win
 '@ | Set-Content -LiteralPath $notes -Encoding utf8
     $results = @()
     foreach ($scenario in @('success', 'rollback')) {
+        $elapsed = [Diagnostics.Stopwatch]::StartNew()
         $folder = Join-Path $checkRoot $scenario
         New-Item -ItemType Directory -Path $folder | Out-Null
         $target = Join-Path $folder 'Forever-SMP.exe'
@@ -60,6 +61,7 @@ notes_ru = "Изолированная проверка обновления Win
         if ($actualHash -ne $(if ($scenario -eq 'success') { $newHash } else { $oldHash })) { throw 'Incorrect executable after handoff' }
         if ((Get-FileHash -LiteralPath (Join-Path $stage 'old.exe') -Algorithm SHA512).Hash -ne $oldHash) { throw 'Invalid backup' }
         if ([IO.File]::ReadAllText($personal) -ne 'keep my folder, language and optional choices') { throw 'Personal file changed' }
+        Write-Host ('Windows updater {0}: {1:N1}s' -f $scenario, $elapsed.Elapsed.TotalSeconds)
         $results += [pscustomobject]@{ scenario = $scenario; status = $status; executable_verified = $true; backup_verified = $true; personal_file_preserved = $true; job = $job }
     }
     $results | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $checkRoot 'results.json') -Encoding utf8

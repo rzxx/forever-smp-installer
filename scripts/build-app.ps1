@@ -1,7 +1,7 @@
 #requires -Version 7
 param(
     [string]$Repository = 'rzxx/forever-smp-installer',
-    [switch]$Handoff
+    [Alias('Handoff')][switch]$Full = $true
 )
 $ErrorActionPreference = 'Stop'
 $sourceRoot = Split-Path -Parent $PSScriptRoot
@@ -10,7 +10,7 @@ Push-Location $sourceRoot
 try {
     . (Join-Path $PSScriptRoot 'windows-build.ps1')
     Initialize-WindowsBuild
-    & (Join-Path $PSScriptRoot 'test.ps1') -Handoff:$Handoff
+    & (Join-Path $PSScriptRoot 'test.ps1') -Full:$Full
     & cargo build --locked --release -p forever-smp -p forever-release
     if ($LASTEXITCODE) { throw 'Release build failed.' }
     $targetDirectory = Get-CargoTargetDirectory

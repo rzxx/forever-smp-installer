@@ -17,7 +17,8 @@ Clone the existing pack repository beside this checkout for local UI testing:
 ```powershell
 git clone https://github.com/rzxx/forever-smp-installer installer
 git clone https://github.com/rzxx/forever-smp-releases modpack
-./installer/scripts/dev.ps1 -BuildPack
+cd installer
+./scripts/dev.ps1 -BuildPack
 ```
 
 After that, run `./scripts/dev.ps1` from this repo for each installer iteration. It rebuilds and opens `target/debug/forever-smp.exe`, reads a local recipe from the pack checkout, and uses `dist/dev/profile` plus an initially empty `dist/dev/game`. No invitation or signing key is needed. Local mode disables installer self-updates. Keep game-folder selections inside disposable test folders.
@@ -25,11 +26,12 @@ After that, run `./scripts/dev.ps1` from this repo for each installer iteration.
 Use `-BuildPack` after changing the modpack, `-PackRoot <checkout>` for another pack checkout, or `-BuildOnly` to compile without opening the app. A raw `cargo build` only compiles; it does not prepare a test profile or package a release.
 
 ```powershell
-./scripts/test.ps1 -Handoff  # unit/GPUI tests, clippy, Windows replacement and rollback
-./scripts/build-app.ps1 -Handoff  # local checks + unsigned candidate in dist/releases/<app-version>
+./scripts/test.ps1       # tests + lint for ordinary changes
+./scripts/test.ps1 -Full # also test Windows replacement/rollback when changing the updater
+./scripts/build-app.ps1  # full checks + unsigned candidate in dist/releases/<app-version>
 ```
 
-The handoff fixture has its own public test key and never uses production signing keys. Checks and builds run locally; no GitHub Actions runner is used on pushes or PRs. [Release steps](docs/releases.md) describe the local signing/upload command. Public builds and tests never publish or deploy.
+Each command uses the normal `target` cache in this repository. The full Windows updater checks use a public test key and never use production signing keys. Checks and builds run locally; no GitHub Actions runner is used on pushes or PRs. [Release steps](docs/releases.md) describe the local signing/upload command. Public builds and tests never publish or deploy.
 
 ## Source
 
