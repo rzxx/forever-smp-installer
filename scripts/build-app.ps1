@@ -1,5 +1,8 @@
 #requires -Version 7
-param([string]$Repository = 'rzxx/forever-smp-installer')
+param(
+    [string]$Repository = 'rzxx/forever-smp-installer',
+    [switch]$Handoff
+)
 $ErrorActionPreference = 'Stop'
 $sourceRoot = Split-Path -Parent $PSScriptRoot
 $previousFxcPath = $env:GPUI_FXC_PATH
@@ -7,7 +10,7 @@ Push-Location $sourceRoot
 try {
     . (Join-Path $PSScriptRoot 'windows-build.ps1')
     Initialize-WindowsBuild
-    & (Join-Path $PSScriptRoot 'test.ps1')
+    & (Join-Path $PSScriptRoot 'test.ps1') -Handoff:$Handoff
     & cargo build --locked --release -p forever-smp -p forever-release
     if ($LASTEXITCODE) { throw 'Release build failed.' }
     $targetDirectory = Get-CargoTargetDirectory

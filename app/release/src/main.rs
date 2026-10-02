@@ -115,6 +115,22 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Some("verify") if args.len() == 3 => {
+            let release = verify_release(&fs::read(&args[1])?, &args[2])?;
+            println!(
+                "Verified pack candidate: {} / {}",
+                release.pack_id, release.version
+            );
+            Ok(())
+        }
+        Some("verify-app") if args.len() == 2 => {
+            let release = verify_app_release(&fs::read(&args[1])?, INSTALLER_PUBLIC_KEY)?;
+            println!(
+                "Verified installer candidate: {} / {}",
+                release.app_id, release.version
+            );
+            Ok(())
+        }
         Some("check-feed") if args.len() == 3 => {
             let release = fetch_release(&args[1], &args[2])?;
             println!(
@@ -149,7 +165,7 @@ fn main() -> Result<()> {
         }
         Some("restore") if args.len() == 2 => restore_last(Path::new(&args[1])),
         _ => bail!(
-            "Usage:\n  forever-release build <workspace> <mrpack> <output-directory>\n  forever-release check <release.json>\n  forever-release install <release.json> <game-directory> [verified-cache-directory]\n  forever-release restore <game-directory>\n  forever-release keygen <private-key-path>\n  forever-release sign <release.json> <private-key-path> <release.signed.json>\n  forever-release check-feed <repository> <public-key>\n  forever-release build-installer <exe> <app-version> <repository> <notes.toml> <output.json>\n  forever-release sign-app <installer.json> <private-key-path> <installer.signed.json>\n  forever-release check-app-feed <repository> <public-key>"
+            "Usage:\n  forever-release build <workspace> <mrpack> <output-directory>\n  forever-release check <release.json>\n  forever-release verify <release.signed.json> <public-key>\n  forever-release verify-app <installer.signed.json>\n  forever-release install <release.json> <game-directory> [verified-cache-directory]\n  forever-release restore <game-directory>\n  forever-release keygen <private-key-path>\n  forever-release sign <release.json> <private-key-path> <release.signed.json>\n  forever-release check-feed <repository> <public-key>\n  forever-release build-installer <exe> <app-version> <repository> <notes.toml> <output.json>\n  forever-release sign-app <installer.json> <private-key-path> <installer.signed.json>\n  forever-release check-app-feed <repository> <public-key>"
         ),
     }
 }

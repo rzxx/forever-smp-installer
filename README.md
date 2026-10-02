@@ -26,10 +26,10 @@ Use `-BuildPack` after changing the modpack, `-PackRoot <checkout>` for another 
 
 ```powershell
 ./scripts/test.ps1 -Handoff  # unit/GPUI tests, clippy, Windows replacement and rollback
-./scripts/build-app.ps1     # unsigned release candidate in dist/releases/<app-version>
+./scripts/build-app.ps1 -Handoff  # local checks + unsigned candidate in dist/releases/<app-version>
 ```
 
-The handoff fixture has its own public test key and never uses production signing keys. [Release steps](docs/releases.md) describe signing and publishing separately. Builds and tests never publish or deploy.
+The handoff fixture has its own public test key and never uses production signing keys. Checks and builds run locally; no GitHub Actions runner is used on pushes or PRs. [Release steps](docs/releases.md) describe the local signing/upload command. Public builds and tests never publish or deploy.
 
 ## Source
 

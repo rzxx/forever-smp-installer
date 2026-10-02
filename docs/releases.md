@@ -1,21 +1,19 @@
 # Installer releases
 
-The existing release channel is `rzxx/forever-smp-installer`. Version comes from the workspace `Cargo.toml`; notes come from `app-release.toml`. Pack releases have their own version and repository.
+Installer releases are independent of modpack releases. Version comes from workspace `Cargo.toml`; notes come from `app-release.toml`. The existing channel is `rzxx/forever-smp-installer`.
 
-1. Change source, run `./scripts/dev.ps1` for UI checks and `./scripts/test.ps1 -Handoff` for automated checks.
-2. Bump the app version and update both languages of release notes. Run `./scripts/build-app.ps1`.
-3. Sign the generated `installer.json` with the existing private installer key, stored outside the public checkout:
+In the private local workspace, bump the installer version, update both languages of app notes, then run from the parent directory:
 
 ```powershell
-$version = '0.1.11' # use the actual new version
-$output = "dist/releases/$version"
-./target/release/forever-release.exe sign-app "$output/installer.json" ../.private/installer-signing-key.txt "$output/installer.signed.json"
+./scripts/release.ps1 installer
 ```
 
-4. Review the ZIP and metadata, then create a draft release in this repository with exactly the versioned EXE, versioned ZIP, `installer.json` and `installer.signed.json`. Test that downloaded candidate before marking the draft latest.
+That one command runs the installer tests, clippy and Windows replacement/rollback fixtures on your PC, builds the EXE/ZIP, signs `installer.json` with the existing local key, and verifies the signature against the compiled installer trust pin. Output is `installer/dist/releases/<app-version>`. It does not build or release a pack.
 
-The ZIP contains only `Forever-SMP.exe` and a short README. Never upload a directory wholesale. The `handoff-fixture` example is a test binary and must never be shipped.
+Add `-Upload` to build locally and upload a draft to the installer repo; add `-Publish` to build locally and publish it as latest. Upload requires clean, committed source already pushed to this repo. Bilingual notes and the four asset filenames are supplied automatically. Published versions are refused; a failed draft upload can be retried.
 
-Published versions are immutable: source publication does not replace the existing 0.1.10 executable. Never overwrite an existing release's assets. Keep `installer.signed.json` and versioned executable names unchanged; installed clients use those URLs. Private signing keys must be backed up and reused, not regenerated. Public trust pins in source are safe to publish.
+For an unsigned build from this public checkout alone, use `./scripts/build-app.ps1 -Handoff`. This needs no private keys. Signing/upload automation stays in the private workspace. No GitHub Actions runner is used for checks or builds.
 
-The metadata signature authenticates updates; it is separate from Windows Authenticode signing. Windows x64 is the supported desktop target.
+The release assets are the versioned EXE, versioned ZIP, `installer.json` and `installer.signed.json`. The ZIP contains only `Forever-SMP.exe` and a short README. Keep the signed feed filename and versioned executable filenames unchanged: installed clients use those URLs. Never ship the `handoff-fixture` test example, keys or invitations.
+
+Private signing keys stay local, are backed up and reused, and are never regenerated per release. Public trust pins belong in source. Metadata signing is separate from Windows Authenticode signing. Windows x64 is the supported desktop target.
