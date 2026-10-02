@@ -1,7 +1,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod inputs;
+
 use anyhow::{Context as _, Result, ensure};
 use forever_core::*;
 use gpui::{div, prelude::*, px, rgb, size, *};
+use gpui_component::{
+    Root, Sizable,
+    button::{Button, ButtonVariants},
+    checkbox::Checkbox,
+    input::{InputEvent, InputState},
+    spinner::Spinner,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -67,6 +76,7 @@ enum Step {
     Error,
 }
 struct Wizard {
+    focus_handle: FocusHandle,
     prefs: Preferences,
     step: Step,
     release: Option<Release>,
@@ -76,12 +86,14 @@ struct Wizard {
     replace: bool,
     error: String,
     progress: Arc<Mutex<String>>,
-    focus: FocusHandle,
+    nickname: Entity<InputState>,
     request_copied: bool,
     feedback: Option<String>,
     advanced: bool,
     app_update: Option<AppOffer>,
     folder_return: Option<Step>,
+    folder_path: Entity<InputState>,
+    folder_error: Option<String>,
 }
 fn fitted_window_bounds(display: Bounds<Pixels>) -> Bounds<Pixels> {
     let width = (f32::from(display.size.width) - 48.).clamp(1., 660.);
@@ -101,11 +113,11 @@ fn preference_path() -> PathBuf {
 }
 #[cfg(test)]
 fn preference_path() -> PathBuf {
-    static PROFILE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    PROFILE
-        .get_or_init(|| tempfile::tempdir().unwrap())
-        .path()
-        .join("preferences.json")
+    // Each UI test runs on its own thread; don't let parallel tests overwrite preferences.
+    thread_local! {
+        static PROFILE: tempfile::TempDir = tempfile::tempdir().unwrap();
+    }
+    PROFILE.with(|profile| profile.path().join("preferences.json"))
 }
 fn bundled_recipe() -> Option<PathBuf> {
     std::env::current_exe()
@@ -130,8 +142,23 @@ fn plan_for_resume(game: &std::path::Path, approved: &Plan) -> Result<Plan> {
         && current.conflicts.is_empty();
     Ok(if committed { current } else { approved.clone() })
 }
+fn prepare_game_folder(game: &std::path::Path, release: &Release) -> Result<Plan> {
+    if game.join(".forever-smp/pending").exists() {
+        recover(game)?;
+    }
+    let previous = load_state(game, release)?;
+    let _ = cleanup_game_backups(game);
+    let choices = release.choices(previous.as_ref());
+    let recommended = previous.as_ref().is_none_or(|state| state.recommended);
+    plan(game, release, choices, recommended)
+}
+fn prepare_existing_folder(game: Option<&PathBuf>, release: &Release) -> Result<Option<Plan>> {
+    game.filter(|path| path.is_dir())
+        .map(|path| prepare_game_folder(path, release))
+        .transpose()
+}
 impl Wizard {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut prefs: Preferences = fs::read(preference_path())
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
@@ -152,7 +179,52 @@ impl Wizard {
         } else {
             Step::Source
         };
-        Self {
+        let folder_path = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(
+                    prefs
+                        .game
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                )
+                .validate(|text, _| !text.chars().any(char::is_control))
+        });
+        cx.subscribe_in(&folder_path, window, |this, _, event, window, cx| {
+            match event {
+                InputEvent::Change => this.folder_error = None,
+                InputEvent::PressEnter { .. } => {
+                    this.use_game_folder(cx);
+                    if this.step != Step::Folder {
+                        this.focus_handle.focus(window);
+                    }
+                }
+                _ => {}
+            }
+            cx.notify();
+        })
+        .detach();
+        let nickname = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(prefs.nickname.clone())
+                .validate(|text, _| {
+                    text.len() <= 16 && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                })
+        });
+        cx.subscribe(&nickname, |this, input, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.prefs.nickname = input.read(cx).value().to_string();
+                this.request_copied = false;
+            }
+            cx.notify();
+        })
+        .detach();
+        // Keep a focus target for page transitions so Root's Tab navigation
+        // works before a control is clicked. The page itself is not a tab stop.
+        let focus_handle = cx.focus_handle().tab_stop(false);
+        focus_handle.focus(window);
+        let wizard = Self {
+            focus_handle,
             prefs,
             step,
             release: None,
@@ -162,13 +234,17 @@ impl Wizard {
             replace: false,
             error: String::new(),
             progress: Arc::default(),
-            focus: cx.focus_handle(),
+            nickname,
             request_copied: false,
             feedback: None,
             advanced: false,
             app_update: None,
             folder_return: None,
-        }
+            folder_path,
+            folder_error: None,
+        };
+        wizard.set_input_placeholders(window, cx);
+        wizard
     }
     fn t<'a>(&self, en: &'a str, ru: &'a str) -> &'a str {
         if self.prefs.language == "ru" { ru } else { en }
@@ -185,18 +261,95 @@ impl Wizard {
         self.step = Step::Error;
         cx.notify();
     }
-    fn open_folder(&mut self, cx: &mut Context<Self>) {
+    fn set_input_placeholders(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.nickname.update(cx, |input, cx| {
+            input.set_placeholder(self.t("Minecraft nickname", "Ник Minecraft"), window, cx)
+        });
+        self.folder_path.update(cx, |input, cx| {
+            input.set_placeholder(
+                self.t("Paste the game folder path", "Вставьте путь к папке игры"),
+                window,
+                cx,
+            )
+        });
+    }
+    fn open_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.folder_return = Some(self.step);
+        let path = self
+            .prefs
+            .game
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        self.folder_path
+            .update(cx, |input, cx| input.set_value(path, window, cx));
+        self.folder_error = None;
         self.step = Step::Folder;
         cx.notify();
     }
-    fn select_game_folder(&mut self, path: PathBuf) -> Result<()> {
+    fn use_game_folder(&mut self, cx: &mut Context<Self>) {
+        if self.step != Step::Folder {
+            return;
+        }
+        let value = self.folder_path.read(cx).value();
+        let text = value.trim();
+        // Explorer's "Copy as path" includes surrounding quotes.
+        let text = text
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(text);
+        let path = PathBuf::from(text);
+        let invalid_path = self
+            .t(
+                "Enter the full path to an existing game folder.",
+                "Введите полный путь к существующей папке игры.",
+            )
+            .to_owned();
+        if text.is_empty() || !path.is_absolute() {
+            self.folder_error = Some(invalid_path);
+            cx.notify();
+            return;
+        }
+        let Some(release) = self.release.clone() else {
+            self.folder_error = Some(
+                self.t("Choose a release first.", "Сначала выберите выпуск.")
+                    .into(),
+            );
+            cx.notify();
+            return;
+        };
+        let job = cx.background_executor().spawn(async move {
+            ensure!(path.is_dir(), invalid_path);
+            let checked = prepare_game_folder(&path, &release)?;
+            Ok::<_, anyhow::Error>((path, checked))
+        });
+        self.folder_error = None;
+        self.step = Step::Busy;
+        *self.progress.lock().unwrap() = self
+            .t("Checking game folder…", "Проверяем папку игры…")
+            .into();
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            let _ = this.update(cx, |this, cx| {
+                let result =
+                    result.and_then(|(path, checked)| this.select_game_folder(path, checked));
+                if let Err(error) = result {
+                    this.step = Step::Folder;
+                    this.folder_error = Some(format!("{error:#}"));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+    fn select_game_folder(&mut self, path: PathBuf, checked: Plan) -> Result<()> {
         let previous = self.prefs.game.replace(path);
-        if let Err(error) = self.make_plan() {
+        if let Err(error) = self.save() {
             self.prefs.game = previous;
             return Err(error);
         }
-        self.save()?;
+        self.set_plan(checked);
         self.feedback = None;
         self.folder_return = None;
         self.choose_review_step();
@@ -222,7 +375,7 @@ impl Wizard {
                     .unwrap_or_else(|| self.t("Not selected yet", "Пока не выбрана").into()),
             )
     }
-    fn pick(&mut self, selection: Selection, cx: &mut Context<Self>) {
+    fn pick(&mut self, selection: Selection, window: &mut Window, cx: &mut Context<Self>) {
         let folder = matches!(selection, Selection::Folder);
         let job = cx.prompt_for_paths(PathPromptOptions {
             files: !folder,
@@ -244,7 +397,7 @@ impl Wizard {
                 .into(),
             ),
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = job
                 .await
                 .context("The file dialog could not return a selection")
@@ -258,10 +411,13 @@ impl Wizard {
                 }
             };
             if let Some(path) = paths.into_iter().next() {
-                let _ = this.update(cx, |this, cx| {
+                let _ = this.update_in(cx, |this, window, cx| {
                     let result = (|| -> Result<()> {
                         if folder {
-                            this.select_game_folder(path)?;
+                            this.folder_path.update(cx, |input, cx| {
+                                input.set_value(path.display().to_string(), window, cx)
+                            });
+                            this.folder_error = None;
                         } else if matches!(selection, Selection::Channel) {
                             let channel: UpdateChannel = serde_json::from_slice(&fs::read(path)?)?;
                             github_feed(&channel.repository)?;
@@ -280,9 +436,8 @@ impl Wizard {
                             this.prefs.recipe = Some(path);
                             this.prefs.use_local_release = true;
                             this.app_update = None;
-                            this.release = Some(release);
                             this.save()?;
-                            this.after_source()?;
+                            this.load_release(cx, false);
                         }
                         Ok(())
                     })();
@@ -301,8 +456,9 @@ impl Wizard {
         let channel = self.prefs.channel();
         let local = self.prefs.use_local_release;
         let path = self.prefs.recipe.clone();
+        let game = self.prefs.game.clone();
         let job = cx.background_executor().spawn(async move {
-            if !local {
+            let (release, app) = if !local {
                 std::thread::scope(|scope| {
                     let pack =
                         scope.spawn(|| fetch_release(&channel.repository, &channel.public_key));
@@ -322,7 +478,9 @@ impl Wizard {
                 let r: Release = serde_json::from_slice(&fs::read(path)?)?;
                 r.validate()?;
                 Ok((r, None))
-            }
+            }?;
+            let checked = prepare_existing_folder(game.as_ref(), &release)?;
+            Ok::<_, anyhow::Error>((release, app, checked))
         });
         self.step = Step::Busy;
         *self.progress.lock().unwrap() = self.t("Checking release…", "Проверяем выпуск…").into();
@@ -330,11 +488,9 @@ impl Wizard {
             let result = job.await;
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok((r, app)) => {
+                    Ok((r, app, checked)) => {
                         this.app_update = app;
-                        if let Err(e) = this.finish_check(r, explicit_check) {
-                            this.fail(format!("{e:#}"), cx);
-                        }
+                        this.finish_check(r, explicit_check, checked);
                     }
                     Err(e) => this.fail(format!("{e:#}"), cx),
                 }
@@ -344,17 +500,16 @@ impl Wizard {
         .detach();
         cx.notify();
     }
-    fn finish_check(&mut self, release: Release, explicit_check: bool) -> Result<()> {
+    fn finish_check(&mut self, release: Release, explicit_check: bool, checked: Option<Plan>) {
         self.release = Some(release);
-        self.after_source()?;
+        self.after_source(checked);
         if explicit_check && matches!(self.step, Step::Ready | Step::Access) {
             self.step = Step::CheckResult;
         }
-        Ok(())
     }
-    fn after_source(&mut self) -> Result<()> {
-        if self.prefs.game.as_ref().is_some_and(|p| p.is_dir()) {
-            self.make_plan()?;
+    fn after_source(&mut self, checked: Option<Plan>) {
+        if let Some(checked) = checked {
+            self.set_plan(checked);
             self.choose_review_step();
             if matches!(self.step, Step::Ready | Step::Access) {
                 let version = &self.release.as_ref().unwrap().version;
@@ -372,9 +527,9 @@ impl Wizard {
                 });
             }
         } else {
+            self.plan = None;
             self.step = Step::Folder;
         }
-        Ok(())
     }
     fn choose_review_step(&mut self) {
         let p = self.plan.as_ref().unwrap();
@@ -434,52 +589,42 @@ impl Wizard {
     ) -> Stateful<Div> {
         let enabled = *self.choices.get(&feature.id).unwrap_or(&false);
         let id = feature.id.clone();
-        let label = format!(
-            "{} {}",
-            if enabled { "☑" } else { "☐" },
-            if self.prefs.language == "ru" {
-                &feature.ru
-            } else {
-                &feature.en
-            }
-        );
+        let label = if self.prefs.language == "ru" {
+            feature.ru.clone()
+        } else {
+            feature.en.clone()
+        };
+        let checkbox_id = ElementId::Name(format!("checkbox-{selector}").into());
         div()
             .id(ElementId::Name(selector.clone().into()))
             .debug_selector(move || selector.clone())
-            .w_full()
             .flex()
-            .items_center()
-            .gap_3()
-            .px_3()
-            .py_2()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(if enabled { 0x54866c } else { 0x35463e }))
-            .bg(rgb(if enabled { 0x243c2f } else { 0x24312c }))
-            .hover(|style| style.bg(rgb(0x35463e)))
-            .cursor_pointer()
-            .child(div().flex_1().child(label))
-            .child(div().flex_shrink_0().text_sm().child(self.t(
-                if enabled { "On" } else { "Off" },
-                if enabled { "Вкл." } else { "Выкл." },
-            )))
-            .on_click(cx.listener(move |s, _, _, cx| {
-                let value = s.choices.entry(id.clone()).or_default();
-                *value = !*value;
-                s.recommended = false;
-                if s.step == Step::Review {
-                    match plan(
-                        s.prefs.game.as_ref().unwrap(),
-                        s.release.as_ref().unwrap(),
-                        s.choices.clone(),
-                        s.recommended,
-                    ) {
-                        Ok(p) => s.plan = Some(p),
-                        Err(error) => s.fail(format!("{error:#}"), cx),
-                    }
-                }
-                cx.notify();
-            }))
+            .flex_col()
+            .child(
+                Checkbox::new(checkbox_id)
+                    .label(label)
+                    .checked(enabled)
+                    .w_full()
+                    .px_3()
+                    .py_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(if enabled { 0x54866c } else { 0x35463e }))
+                    .bg(rgb(if enabled { 0x243c2f } else { 0x24312c }))
+                    .hover(|style| style.bg(rgb(0x35463e)))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |s, checked, _, cx| {
+                        if !matches!(s.step, Step::Options | Step::Review) {
+                            return;
+                        }
+                        s.choices.insert(id.clone(), *checked);
+                        s.recommended = false;
+                        if s.step == Step::Review {
+                            s.review_options(true, cx);
+                        }
+                        cx.notify();
+                    })),
+            )
     }
     fn advanced_controls(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         div()
@@ -522,7 +667,7 @@ impl Wizard {
                         .into(),
                         false,
                         cx,
-                        |s, _, cx| s.pick(Selection::Release, cx),
+                        |s, w, cx| s.pick(Selection::Release, w, cx),
                     ),
                 )
                 .child(
@@ -535,7 +680,7 @@ impl Wizard {
                         .into(),
                         false,
                         cx,
-                        |s, _, cx| s.pick(Selection::Channel, cx),
+                        |s, w, cx| s.pick(Selection::Channel, w, cx),
                     ),
                 )
                 .child(
@@ -574,16 +719,93 @@ impl Wizard {
     fn make_plan(&mut self) -> Result<()> {
         let release = self.release.as_ref().context("No release selected")?;
         let game = self.prefs.game.as_ref().context("Choose a game folder")?;
-        if game.join(".forever-smp/pending").exists() {
-            recover(game)?;
-        }
-        let previous = load_state(game, release)?;
-        let _ = cleanup_game_backups(game);
-        self.choices = release.choices(previous.as_ref());
-        self.recommended = previous.as_ref().is_none_or(|s| s.recommended);
-        self.plan = Some(plan(game, release, self.choices.clone(), self.recommended)?);
-        self.replace = false;
+        self.set_plan(prepare_game_folder(game, release)?);
         Ok(())
+    }
+    fn set_plan(&mut self, checked: Plan) {
+        self.choices = checked.choices.clone();
+        self.recommended = checked.recommended;
+        self.plan = Some(checked);
+        self.replace = false;
+    }
+    fn open_options(&mut self, cx: &mut Context<Self>) {
+        if self.step == Step::Busy {
+            return;
+        }
+        let Some(game) = self.prefs.game.clone() else {
+            return;
+        };
+        let Some(release) = self.release.clone() else {
+            return;
+        };
+        let job = cx.background_executor().spawn(async move {
+            if game.join(".forever-smp/pending").exists() {
+                recover(&game)?;
+            }
+            let previous = load_state(&game, &release)?;
+            Ok::<_, anyhow::Error>((
+                release.choices(previous.as_ref()),
+                previous.as_ref().is_none_or(|state| state.recommended),
+            ))
+        });
+        self.step = Step::Busy;
+        *self.progress.lock().unwrap() = self
+            .t("Checking game folder…", "Проверяем папку игры…")
+            .into();
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok((choices, recommended)) => {
+                        this.choices = choices;
+                        this.recommended = recommended;
+                        this.replace = false;
+                        this.step = Step::Options;
+                    }
+                    Err(error) => this.fail(format!("{error:#}"), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+    fn review_options(&mut self, keep_review: bool, cx: &mut Context<Self>) {
+        if !matches!(self.step, Step::Options | Step::Review) {
+            return;
+        }
+        let Some(game) = self.prefs.game.clone() else {
+            return;
+        };
+        let Some(release) = self.release.clone() else {
+            return;
+        };
+        let choices = self.choices.clone();
+        let recommended = self.recommended;
+        let job = cx
+            .background_executor()
+            .spawn(async move { plan(&game, &release, choices, recommended) });
+        self.step = Step::Busy;
+        *self.progress.lock().unwrap() = self.t("Checking changes…", "Проверяем изменения…").into();
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(checked) => {
+                        this.plan = Some(checked);
+                        if keep_review {
+                            this.step = Step::Review;
+                        } else {
+                            this.choose_review_step();
+                        }
+                    }
+                    Err(error) => this.fail(format!("{error:#}"), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
     fn adopt_folder(&mut self, cx: &mut Context<Self>) {
         let Some(game) = self.prefs.game.clone() else {
@@ -802,15 +1024,46 @@ impl Wizard {
         div()
             .id(id)
             .debug_selector(move || id.into())
-            .px_5()
-            .py_3()
-            .rounded_lg()
-            .cursor_pointer()
-            .bg(rgb(if primary { 0x80d4b0 } else { 0x24312c }))
-            .text_color(rgb(if primary { 0x102019 } else { 0xdae9e1 }))
-            .hover(|s| s.bg(rgb(if primary { 0x9ae5c4 } else { 0x35463e })))
-            .child(label)
-            .on_click(cx.listener(move |this, _, window, cx| action(this, window, cx)))
+            .flex()
+            .min_w_0()
+            .child(
+                Button::new(ElementId::Name(format!("button-{id}").into()))
+                    // Keep label contrast across the component's hover states.
+                    .child(
+                        div()
+                            .text_color(rgb(if primary { 0x102019 } else { 0xdae9e1 }))
+                            .child(label),
+                    )
+                    .when(primary, |button| button.primary())
+                    .large()
+                    .flex_1()
+                    .h(px(50.))
+                    .px_5()
+                    .rounded(px(8.))
+                    .border_0()
+                    .focus(move |style| {
+                        // Keep GPUI's outer focus ring aligned with the rounded
+                        // button. Inset the stronger border and compensate its
+                        // padding so the label does not move when focus changes.
+                        style.border_2().px(px(18.)).border_color(rgb(if primary {
+                            0x285e48
+                        } else {
+                            0x80d4b0
+                        }))
+                    })
+                    .justify_start()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, event, window, cx| {
+                        let previous_step = this.step;
+                        if matches!(event, ClickEvent::Mouse(_)) {
+                            this.focus_handle.focus(window);
+                        }
+                        action(this, window, cx);
+                        if this.step != previous_step {
+                            this.focus_handle.focus(window);
+                        }
+                    })),
+            )
     }
     fn restore(&mut self, recovery: bool, cx: &mut Context<Self>) {
         let Some(game) = self.prefs.game.clone() else {
@@ -841,35 +1094,27 @@ impl Wizard {
     }
 }
 
-fn nickname_caret(focused: bool) -> Div {
-    div()
-        .w(px(2.))
-        .h(px(20.))
-        .flex_shrink_0()
-        .bg(rgb(0x80d4b0))
-        .when(!focused, |caret| caret.invisible())
-}
-
 impl Render for Wizard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let nickname_focused = self.focus.is_focused(window);
-        let mut body = div().flex().flex_col().gap_4();
+        let mut body = div().flex().flex_col().w_full().gap_4();
         let title: String;
         match self.step {
             Step::Language => {
                 title = "Добро пожаловать / Welcome".into();
                 body = body
                     .child("Forever SMP")
-                    .child(self.button("ru", "Русский".into(), true, cx, |s, _, cx| {
+                    .child(self.button("ru", "Русский".into(), true, cx, |s, w, cx| {
                         s.prefs.language = "ru".into();
+                        s.set_input_placeholders(w, cx);
                         if let Err(e) = s.save() {
                             s.fail(e, cx);
                             return;
                         }
                         s.load_release(cx, false);
                     }))
-                    .child(self.button("en", "English".into(), false, cx, |s, _, cx| {
+                    .child(self.button("en", "English".into(), false, cx, |s, w, cx| {
                         s.prefs.language = "en".into();
+                        s.set_input_placeholders(w, cx);
                         if let Err(e) = s.save() {
                             s.fail(e, cx);
                             return;
@@ -902,30 +1147,40 @@ impl Render for Wizard {
                 let r = self.release.as_ref().unwrap();
                 body = body.child(format!("Minecraft {} · Fabric {} · Java {}+", r.minecraft, r.fabric, r.java))
                     .child(self.t("Set these up in your launcher first. Use a separate game folder. Close Minecraft before continuing.", "Сначала настройте их в лаунчере. Используйте отдельную папку игры. Закройте Minecraft."))
-                    .child(self.selected_folder())
-                    .child(self.button("folder", self.t("Choose folder", "Выбрать папку").into(), true, cx, |s, _, cx| s.pick(Selection::Folder, cx)));
-                if self.prefs.game.as_ref().is_some_and(|p| p.is_dir()) {
-                    body = body.child(self.button(
+                    .child(div().text_sm().child(self.t("Game folder", "Папка игры")))
+                    .child(div().flex().items_center().gap_3()
+                        .child(div().flex_1().min_w_0().child(inputs::field("game-path", &self.folder_path, window, cx)))
+                        .child(self.button("folder", self.t("Browse…", "Обзор…").into(), false, cx, |s, w, cx| s.pick(Selection::Folder, w, cx)).flex_shrink_0()))
+                    .child(div().text_sm().text_color(rgb(0xa4baad)).child(self.t(
+                        "Paste a path from your launcher or browse for a folder.",
+                        "Вставьте путь из лаунчера или выберите папку через обзор.",
+                    )));
+                if let Some(error) = &self.folder_error {
+                    body = body.child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0xffb4a5))
+                            .child(error.clone()),
+                    );
+                }
+                body = body
+                    .child(self.button(
                         "use-folder",
                         self.t("Use this folder", "Использовать эту папку").into(),
+                        true,
+                        cx,
+                        |s, _, cx| s.use_game_folder(cx),
+                    ))
+                    .child(self.button(
+                        "folder-back",
+                        self.t("Back", "Назад").into(),
                         false,
                         cx,
-                        |s, _, cx| match s.select_game_folder(s.prefs.game.clone().unwrap()) {
-                            Ok(()) => cx.notify(),
-                            Err(error) => s.fail(format!("{error:#}"), cx),
+                        |s, _, cx| {
+                            s.step = s.folder_return.take().unwrap_or(Step::Language);
+                            cx.notify();
                         },
                     ));
-                }
-                body = body.child(self.button(
-                    "folder-back",
-                    self.t("Back", "Назад").into(),
-                    false,
-                    cx,
-                    |s, _, cx| {
-                        s.step = s.folder_return.take().unwrap_or(Step::Language);
-                        cx.notify();
-                    },
-                ));
             }
             Step::Review => {
                 let p = self.plan.as_ref().unwrap();
@@ -1068,7 +1323,7 @@ impl Render for Wizard {
                         self.t("Change game folder", "Изменить папку игры").into(),
                         false,
                         cx,
-                        |s, _, cx| s.open_folder(cx),
+                        |s, w, cx| s.open_folder(w, cx),
                     ));
                 if p.previous.is_none() && !p.extras.is_empty() {
                     body = body.child(
@@ -1115,21 +1370,7 @@ impl Render for Wizard {
                         self.t("Review changes", "Проверить изменения").into(),
                         true,
                         cx,
-                        |s, _, cx| {
-                            match plan(
-                                s.prefs.game.as_ref().unwrap(),
-                                s.release.as_ref().unwrap(),
-                                s.choices.clone(),
-                                s.recommended,
-                            ) {
-                                Ok(p) => {
-                                    s.plan = Some(p);
-                                    s.choose_review_step();
-                                }
-                                Err(e) => s.fail(format!("{e:#}"), cx),
-                            };
-                            cx.notify();
-                        },
+                        |s, _, cx| s.review_options(false, cx),
                     ));
             }
             Step::CheckResult => {
@@ -1167,7 +1408,14 @@ impl Render for Wizard {
             Step::Busy => {
                 title = self.t("Working…", "Подготавливаем…").into();
                 body = body
-                    .child(self.progress.lock().unwrap().clone())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(Spinner::new().small())
+                            .child(self.progress.lock().unwrap().clone()),
+                    )
                     .child(self.t("Keep this window open.", "Оставьте это окно открытым."));
             }
             Step::Access => {
@@ -1182,75 +1430,7 @@ impl Render for Wizard {
                         "Enter your exact Minecraft nickname. Send the request to the owner.",
                         "Введите точный ник Minecraft. Отправьте заявку владельцу.",
                     ))
-                    .child(
-                        div()
-                            .id("nickname")
-                            .debug_selector(|| "nickname".into())
-                            .track_focus(&self.focus)
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .p_3()
-                            .rounded_md()
-                            .border_2()
-                            .border_color(rgb(0x456052))
-                            .bg(rgb(0x25352d))
-                            .hover(|s| {
-                                if nickname_focused {
-                                    s
-                                } else {
-                                    s.bg(rgb(0x2c4035)).border_color(rgb(0x679c80))
-                                }
-                            })
-                            .focus(|s| s.bg(rgb(0x1c3026)).border_color(rgb(0x80d4b0)))
-                            .cursor_text()
-                            .when(self.prefs.nickname.is_empty(), |field| {
-                                field.child(nickname_caret(nickname_focused))
-                            })
-                            .child(
-                                div()
-                                    .when(self.prefs.nickname.is_empty(), |text| {
-                                        text.text_color(rgb(0xa4baad))
-                                    })
-                                    .child(if self.prefs.nickname.is_empty() {
-                                        self.t("Click and type nickname", "Нажмите и введите ник")
-                                            .to_owned()
-                                    } else {
-                                        self.prefs.nickname.clone()
-                                    }),
-                            )
-                            .when(!self.prefs.nickname.is_empty(), |field| {
-                                field.child(nickname_caret(nickname_focused))
-                            })
-                            .on_mouse_down_out(cx.listener(|s, _, w, _| {
-                                if s.focus.is_focused(w) {
-                                    w.blur();
-                                }
-                            }))
-                            .on_click(cx.listener(|s, _, w, _| s.focus.focus(w)))
-                            .on_key_down(cx.listener(|s, event: &KeyDownEvent, _, cx| {
-                                if event.keystroke.key == "backspace" {
-                                    s.prefs.nickname.pop();
-                                } else if event.keystroke.key == "v"
-                                    && (event.keystroke.modifiers.control
-                                        || event.keystroke.modifiers.platform)
-                                {
-                                    if let Some(text) =
-                                        cx.read_from_clipboard().and_then(|v| v.text())
-                                        && access_request(text.trim()).is_ok()
-                                    {
-                                        s.prefs.nickname = text.trim().into();
-                                    }
-                                } else if let Some(text) = &event.keystroke.key_char
-                                    && s.prefs.nickname.len() + text.len() <= 16
-                                    && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                                {
-                                    s.prefs.nickname.push_str(text);
-                                }
-                                s.request_copied = false;
-                                cx.notify();
-                            })),
-                    )
+                    .child(inputs::field("nickname", &self.nickname, window, cx))
                     .child(
                         self.button(
                             "copy",
@@ -1334,13 +1514,7 @@ impl Render for Wizard {
                                 .into(),
                             false,
                             cx,
-                            |s, _, cx| {
-                                match s.make_plan() {
-                                    Ok(()) => s.step = Step::Options,
-                                    Err(e) => s.fail(format!("{e:#}"), cx),
-                                }
-                                cx.notify();
-                            },
+                            |s, _, cx| s.open_options(cx),
                         ),
                     )
                     .child(self.button(
@@ -1358,7 +1532,7 @@ impl Render for Wizard {
                         self.t("Change game folder", "Изменить папку игры").into(),
                         false,
                         cx,
-                        |s, _, cx| s.open_folder(cx),
+                        |s, w, cx| s.open_folder(w, cx),
                     ))
                     .child(self.advanced_controls(cx));
             }
@@ -1426,6 +1600,8 @@ impl Render for Wizard {
             }
         }
         div()
+            .id("wizard")
+            .track_focus(&self.focus_handle)
             .size_full()
             .bg(rgb(0x142019))
             .text_color(rgb(0xdae9e1))
@@ -1485,7 +1661,8 @@ fn main() {
             }
         });
     }
-    Application::new().run(move |cx| {
+    Application::new().with_assets(gpui_component_assets::Assets).run(move |cx| {
+        inputs::init(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -1505,9 +1682,9 @@ fn main() {
                     }),
                     ..Default::default()
                 },
-                |_, cx| {
-                    cx.new(|cx| {
-                        let mut wizard = Wizard::new(cx);
+                |window, cx| {
+                    let wizard = cx.new(|cx| {
+                        let mut wizard = Wizard::new(window, cx);
                         #[cfg(debug_assertions)]
                         if let Ok(screen) = std::env::var("FOREVER_SMP_PREVIEW") {
                             if let Some(path) = &wizard.prefs.recipe {
@@ -1515,12 +1692,13 @@ fn main() {
                                     .ok()
                                     .and_then(|b| serde_json::from_slice(&b).ok());
                             }
-                            if wizard.release.is_some() && wizard.prefs.game.is_some() {
+                            if matches!(screen.as_str(), "options" | "review") && wizard.release.is_some() && wizard.prefs.game.is_some() {
                                 let _ = wizard.make_plan();
                             }
                             wizard.step = match screen.as_str() {
                                 "options" if wizard.release.is_some() => Step::Options,
                                 "review" if wizard.plan.is_some() => Step::Review,
+                                "folder" if wizard.release.is_some() => Step::Folder,
                                 "access" => Step::Access,
                                 "ready" => Step::Ready,
                                 _ => Step::Language,
@@ -1543,7 +1721,8 @@ fn main() {
                             wizard.load_release(cx, false);
                         }
                         wizard
-                    })
+                    });
+                    cx.new(|cx| Root::new(wizard, window, cx))
                 },
             )
             .expect("Open Forever SMP window");
@@ -1553,16 +1732,20 @@ fn main() {
         if let Some(job) = finished {
             cx.defer(move |cx| {
                 let acknowledged = acknowledge_app_update(&job, INSTALLER_PUBLIC_KEY, env!("CARGO_PKG_VERSION"));
-                let _ = window.update(cx, |wizard, _, cx| match acknowledged {
-                    Ok(()) => wizard.resume_approved_update(cx),
-                    Err(error) => wizard.fail(format!("{error:#}"), cx),
+                let _ = window.update(cx, |root, _, cx| {
+                    root.view().clone().downcast::<Wizard>().unwrap().update(cx, |wizard, cx| match acknowledged {
+                        Ok(()) => wizard.resume_approved_update(cx),
+                        Err(error) => wizard.fail(format!("{error:#}"), cx),
+                    });
                 });
             });
         }
         #[cfg(debug_assertions)]
         if std::env::var_os("FOREVER_SMP_DIALOG_SMOKE").is_some() {
             cx.defer(move |cx| {
-                let _ = window.update(cx, |wizard, _, cx| wizard.pick(Selection::Folder, cx));
+                let _ = window.update(cx, |root, window, cx| {
+                    root.view().clone().downcast::<Wizard>().unwrap().update(cx, |wizard, cx| wizard.pick(Selection::Folder, window, cx));
+                });
             });
         }
         #[cfg(not(debug_assertions))]
@@ -1572,10 +1755,40 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Preferences, ResumeUpdate, Step, Wizard, fitted_window_bounds, preference_path};
+    use super::{
+        Preferences, ResumeUpdate, Step, Wizard, fitted_window_bounds, preference_path,
+        prepare_game_folder,
+    };
     use forever_core::*;
-    use gpui::{Modifiers, TestAppContext, px, size};
-    use std::{collections::BTreeMap, fs, sync::Arc};
+    use gpui::{
+        AppContext, Context, Entity, Focusable, Modifiers, TestAppContext, VisualTestContext,
+        Window, px, size,
+    };
+    use gpui_component::Root;
+    use std::{collections::BTreeMap, fs};
+
+    fn add_wizard_window(
+        cx: &mut TestAppContext,
+        build: impl FnOnce(&mut Window, &mut Context<Wizard>) -> Wizard,
+    ) -> (Entity<Wizard>, &mut VisualTestContext) {
+        cx.update(super::inputs::init);
+        let (root, visual) = cx.add_window_view(|window, cx| {
+            let wizard = cx.new(|cx| build(window, cx));
+            Root::new(wizard, window, cx)
+        });
+        let wizard =
+            visual.update(|_, cx| root.read(cx).view().clone().downcast::<Wizard>().unwrap());
+        (wizard, visual)
+    }
+
+    fn activate_focused(visual: &mut VisualTestContext, key: &str) {
+        visual.simulate_keystrokes(key);
+        // GPUI component clicks activate on key release; simulate_keystrokes
+        // sends only key-down events.
+        visual.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse(key).unwrap(),
+        });
+    }
 
     #[test]
     fn initial_window_fits_small_and_offset_displays() {
@@ -1610,19 +1823,50 @@ mod tests {
     #[gpui::test]
     fn nickname_field_focuses_types_and_blurs(cx: &mut TestAppContext) {
         for language in ["en", "ru"] {
-            let (view, visual) = cx.add_window_view(|_, cx| {
-                let mut wizard = Wizard::new(cx);
+            let (view, visual) = add_wizard_window(cx, |window, cx| {
+                let mut wizard = Wizard::new(window, cx);
                 wizard.prefs.language = language.into();
                 wizard.prefs.nickname.clear();
+                wizard
+                    .nickname
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                wizard.set_input_placeholders(window, cx);
                 wizard.step = Step::Access;
                 wizard
             });
+            for width in [480., 660., 840.] {
+                visual.simulate_resize(size(px(width), px(680.)));
+                visual.run_until_parked();
+                let bounds = visual.debug_bounds("nickname").unwrap();
+                let copy_bounds = visual.debug_bounds("copy").unwrap();
+                assert_eq!(bounds.size.width, px(width - 64.));
+                assert_eq!(bounds.origin.x, copy_bounds.origin.x);
+                assert_eq!(bounds.size.width, copy_bounds.size.width);
+                assert_eq!(bounds.size.height, px(54.));
+                // The whole field must receive input, including its right edge.
+                visual.simulate_click(
+                    gpui::point(bounds.right() - px(16.), bounds.center().y),
+                    Modifiers::none(),
+                );
+                visual.update(|window, cx| {
+                    assert!(
+                        view.read(cx)
+                            .nickname
+                            .read(cx)
+                            .focus_handle(cx)
+                            .is_focused(window)
+                    );
+                });
+            }
             visual.simulate_resize(size(px(660.), px(680.)));
-            visual.run_until_parked();
-            let bounds = visual.debug_bounds("nickname").unwrap();
-            visual.simulate_click(bounds.center(), Modifiers::none());
             visual.update(|window, cx| {
-                assert!(view.read(cx).focus.is_focused(window));
+                assert!(
+                    view.read(cx)
+                        .nickname
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window)
+                );
             });
             visual.simulate_keystrokes("T e s t _ 1 backspace 2");
             assert_eq!(
@@ -1632,7 +1876,14 @@ mod tests {
             let copy = visual.debug_bounds("copy").unwrap();
             visual.simulate_click(copy.center(), Modifiers::none());
             visual.update(|window, cx| {
-                assert!(!view.read(cx).focus.is_focused(window));
+                assert!(
+                    !view
+                        .read(cx)
+                        .nickname
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window)
+                );
                 assert!(view.read(cx).request_copied);
             });
             visual.simulate_keystrokes("x");
@@ -1642,11 +1893,349 @@ mod tests {
             );
             let bounds = visual.debug_bounds("nickname").unwrap();
             visual.simulate_click(bounds.center(), Modifiers::none());
-            visual.simulate_keystrokes("3");
+            visual.simulate_keystrokes("end 3");
             assert_eq!(
                 view.read_with(visual, |wizard, _| wizard.prefs.nickname.clone()),
                 "Test_23"
             );
+            // Tab reaches the component button, and both activation keys work.
+            visual.simulate_keystrokes("tab");
+            activate_focused(visual, "enter");
+            assert!(view.read_with(visual, |wizard, _| wizard.request_copied));
+            visual.simulate_keystrokes("shift-tab ctrl-a T e s t _ 4");
+            assert!(!view.read_with(visual, |wizard, _| wizard.request_copied));
+            visual.simulate_keystrokes("tab");
+            activate_focused(visual, "space");
+            assert!(view.read_with(visual, |wizard, _| wizard.request_copied));
+        }
+    }
+
+    #[gpui::test]
+    fn game_path_can_be_pasted_edited_validated_and_cancelled(cx: &mut TestAppContext) {
+        for language in ["en", "ru"] {
+            let original = tempfile::tempdir().unwrap();
+            let parent = tempfile::tempdir().unwrap();
+            let game = parent.path().join("Игра 🎮 со пробелами");
+            fs::create_dir(&game).unwrap();
+            let (view, visual) = add_wizard_window(cx, |window, cx| {
+                let mut wizard = Wizard::new(window, cx);
+                wizard.prefs.language = language.into();
+                wizard.prefs.game = Some(original.path().into());
+                wizard.release = Some(Release {
+                    schema: 1,
+                    pack_id: PACK_ID.into(),
+                    version: "0.1.12".into(),
+                    minecraft: "26.3".into(),
+                    fabric: "0.19.5".into(),
+                    java: 25,
+                    notes_en: "Test".into(),
+                    notes_ru: "Проверка".into(),
+                    features: vec![],
+                    mods: vec![],
+                    presets: vec![],
+                });
+                wizard.step = Step::Ready;
+                wizard.open_folder(window, cx);
+                wizard
+            });
+            visual.simulate_resize(size(px(660.), px(680.)));
+            visual.run_until_parked();
+            let field = visual.debug_bounds("game-path").unwrap();
+            let browse = visual.debug_bounds("folder").unwrap();
+            let confirm = visual.debug_bounds("use-folder").unwrap();
+            assert!(field.size.width > px(300.));
+            assert!(browse.size.width > px(80.));
+            assert_eq!(field.origin.x, confirm.origin.x);
+            assert_eq!(browse.right(), confirm.right());
+            assert_eq!(field.size.height, px(54.));
+            visual.simulate_click(field.center(), Modifiers::none());
+            visual.simulate_keystrokes("ctrl-a");
+            visual.update(|_, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string("relative-path".into()));
+            });
+            visual.simulate_keystrokes("ctrl-v");
+            let confirm = visual.debug_bounds("use-folder").unwrap();
+            visual.simulate_click(confirm.center(), Modifiers::none());
+            view.read_with(visual, |wizard, _| {
+                assert_eq!(wizard.step, Step::Folder);
+                assert!(wizard.folder_error.is_some());
+                assert_eq!(wizard.prefs.game.as_deref(), Some(original.path()));
+            });
+            let back = visual.debug_bounds("folder-back").unwrap();
+            visual.simulate_click(back.center(), Modifiers::none());
+            visual.update(|window, cx| {
+                view.update(cx, |wizard, cx| {
+                    assert_eq!(wizard.step, Step::Ready);
+                    wizard.open_folder(window, cx);
+                    assert_eq!(
+                        wizard.folder_path.read(cx).value(),
+                        original.path().to_str().unwrap()
+                    );
+                });
+            });
+            let field = visual.debug_bounds("game-path").unwrap();
+            visual.simulate_click(field.center(), Modifiers::none());
+            visual.simulate_keystrokes("ctrl-a");
+            visual.update(|_, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(format!(
+                    "  \"{}\"  \r\n",
+                    game.display()
+                )));
+            });
+            visual.simulate_keystrokes("ctrl-v end left left left shift-left ctrl-c");
+            visual.update(|_, cx| {
+                assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "и");
+            });
+            // Native input replaces a selection inside a path containing Cyrillic and emoji.
+            visual.simulate_input("и");
+            view.read_with(visual, |wizard, cx| {
+                assert_eq!(
+                    wizard.folder_path.read(cx).value(),
+                    format!("  \"{}\"  ", game.display())
+                );
+                assert!(wizard.folder_error.is_none());
+                assert_eq!(wizard.prefs.game.as_deref(), Some(original.path()));
+            });
+            visual.simulate_keystrokes("enter");
+            view.read_with(visual, |wizard, _| {
+                assert_eq!(wizard.step, Step::Review);
+                assert_eq!(wizard.prefs.game.as_ref(), Some(&game));
+            });
+            let saved: Preferences =
+                serde_json::from_slice(&fs::read(preference_path()).unwrap()).unwrap();
+            assert_eq!(saved.game.as_ref(), Some(&game));
+        }
+    }
+
+    #[gpui::test]
+    fn folder_checks_keep_previous_selection_on_failure_and_allow_retry(cx: &mut TestAppContext) {
+        for language in ["en", "ru"] {
+            let original = tempfile::tempdir().unwrap();
+            let candidate = tempfile::tempdir().unwrap();
+            fs::create_dir(candidate.path().join("mods")).unwrap();
+            let jar = candidate.path().join("mods/test.jar");
+            fs::write(&jar, b"modified").unwrap();
+            let release = Release {
+                schema: 1,
+                pack_id: PACK_ID.into(),
+                version: "0.1.12".into(),
+                minecraft: "26.3".into(),
+                fabric: "0.19.5".into(),
+                java: 25,
+                notes_en: "Test".into(),
+                notes_ru: "Проверка".into(),
+                features: vec![],
+                presets: vec![],
+                mods: vec![ModFile {
+                    id: "test".into(),
+                    path: "mods/test.jar".into(),
+                    sha512: sha512(b"expected"),
+                    size: 8,
+                    urls: vec!["https://example.invalid/test.jar".into()],
+                    feature: None,
+                }],
+            };
+            let (view, visual) = add_wizard_window(cx, |window, cx| {
+                let mut wizard = Wizard::new(window, cx);
+                wizard.prefs.language = language.into();
+                wizard.prefs.game = Some(original.path().into());
+                wizard.release = Some(release);
+                wizard.step = Step::Ready;
+                wizard.save().unwrap();
+                wizard.open_folder(window, cx);
+                wizard.folder_path.update(cx, |input, cx| {
+                    input.set_value(candidate.path().display().to_string(), window, cx)
+                });
+                wizard
+            });
+            visual.simulate_resize(size(px(660.), px(680.)));
+            let saved = fs::read(preference_path()).unwrap();
+            view.update(visual, |wizard, cx| {
+                wizard.use_game_folder(cx);
+                assert_eq!(wizard.step, Step::Busy);
+                assert_eq!(wizard.prefs.game.as_deref(), Some(original.path()));
+                // Repeated confirmation while the check runs must not queue another scan.
+                wizard.use_game_folder(cx);
+                assert_eq!(wizard.step, Step::Busy);
+            });
+            visual.run_until_parked();
+            view.read_with(visual, |wizard, _| {
+                assert_eq!(wizard.step, Step::Folder);
+                assert!(
+                    wizard
+                        .folder_error
+                        .as_ref()
+                        .unwrap()
+                        .contains("Unexpected modified JAR")
+                );
+                assert_eq!(wizard.prefs.game.as_deref(), Some(original.path()));
+                assert!(wizard.plan.is_none());
+            });
+            assert_eq!(fs::read(preference_path()).unwrap(), saved);
+            assert_eq!(fs::read(&jar).unwrap(), b"modified");
+            // An existing folder with matching files succeeds without changing them.
+            fs::write(&jar, b"expected").unwrap();
+            let confirm = visual.debug_bounds("use-folder").unwrap();
+            visual.simulate_click(confirm.center(), Modifiers::none());
+            view.read_with(visual, |wizard, _| {
+                assert_eq!(wizard.step, Step::Review);
+                assert_eq!(wizard.prefs.game.as_deref(), Some(candidate.path()));
+                assert!(wizard.folder_error.is_none());
+                assert!(wizard.plan.as_ref().unwrap().install.is_empty());
+            });
+            assert_eq!(fs::read(&jar).unwrap(), b"expected");
+            let saved: Preferences =
+                serde_json::from_slice(&fs::read(preference_path()).unwrap()).unwrap();
+            assert_eq!(saved.game.as_deref(), Some(candidate.path()));
+            // Opening choices reads the receipt, without rescanning all JARs.
+            // Reviewing them must still reject a changed JAR before applying.
+            let checked = view.read_with(visual, |wizard, _| wizard.plan.clone().unwrap());
+            apply(candidate.path(), &checked, false, None, |_| {}).unwrap();
+            fs::write(&jar, b"modified").unwrap();
+            view.update(visual, |wizard, cx| {
+                wizard.step = Step::Ready;
+                wizard.open_options(cx);
+                assert_eq!(wizard.step, Step::Busy);
+            });
+            visual.run_until_parked();
+            assert!(view.read_with(visual, |wizard, _| wizard.step == Step::Options));
+            let done = visual.debug_bounds("options-done").unwrap();
+            visual.simulate_click(done.center(), Modifiers::none());
+            view.read_with(visual, |wizard, _| {
+                assert_eq!(wizard.step, Step::Error);
+                assert!(wizard.error.contains("Unexpected modified JAR"));
+            });
+            assert_eq!(fs::read(&jar).unwrap(), b"modified");
+        }
+    }
+
+    #[gpui::test]
+    fn both_inputs_support_selection_clipboard_undo_and_redo(cx: &mut TestAppContext) {
+        for language in ["en", "ru"] {
+            for id in ["nickname", "game-path"] {
+                let (view, visual) = add_wizard_window(cx, |window, cx| {
+                    let mut wizard = Wizard::new(window, cx);
+                    wizard.prefs.language = language.into();
+                    wizard
+                        .nickname
+                        .update(cx, |input, cx| input.set_value("Original_1", window, cx));
+                    wizard
+                        .folder_path
+                        .update(cx, |input, cx| input.set_value("Original_1", window, cx));
+                    wizard.set_input_placeholders(window, cx);
+                    wizard.release = Some(Release {
+                        schema: 1,
+                        pack_id: PACK_ID.into(),
+                        version: "0.1.12".into(),
+                        minecraft: "26.3".into(),
+                        fabric: "0.19.5".into(),
+                        java: 25,
+                        notes_en: "Test".into(),
+                        notes_ru: "Проверка".into(),
+                        features: vec![],
+                        mods: vec![],
+                        presets: vec![],
+                    });
+                    wizard.step = if id == "nickname" {
+                        Step::Access
+                    } else {
+                        Step::Folder
+                    };
+                    wizard
+                });
+                visual.simulate_resize(size(px(660.), px(680.)));
+                visual.run_until_parked();
+                let input = view.read_with(visual, |wizard, _| {
+                    if id == "nickname" {
+                        wizard.nickname.clone()
+                    } else {
+                        wizard.folder_path.clone()
+                    }
+                });
+                let assert_value = |visual: &VisualTestContext, expected: &str| {
+                    input.read_with(visual, |input, _| assert_eq!(input.value(), expected));
+                    if id == "nickname" {
+                        view.read_with(visual, |wizard, _| {
+                            assert_eq!(wizard.prefs.nickname, expected)
+                        });
+                    }
+                };
+                let bounds = visual.debug_bounds(id).unwrap();
+                visual.simulate_click(bounds.center(), Modifiers::none());
+                visual.simulate_keystrokes("ctrl-a");
+                visual.update(|_, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string("Edited_2".into()))
+                });
+                visual.simulate_keystrokes("ctrl-v");
+                assert_value(visual, "Edited_2");
+                visual.simulate_keystrokes("ctrl-z");
+                assert_value(visual, "Original_1");
+                visual.simulate_keystrokes("ctrl-y");
+                assert_value(visual, "Edited_2");
+                visual.simulate_keystrokes("ctrl-z ctrl-shift-z");
+                assert_value(visual, "Edited_2");
+                visual.simulate_keystrokes("ctrl-a ctrl-c");
+                visual.update(|_, cx| {
+                    assert_eq!(
+                        cx.read_from_clipboard().unwrap().text().unwrap(),
+                        "Edited_2"
+                    )
+                });
+                visual.simulate_keystrokes("ctrl-x");
+                assert_value(visual, "");
+                visual.simulate_keystrokes("ctrl-v home right delete");
+                visual.simulate_input("x");
+                assert_value(visual, "Exited_2");
+                visual.simulate_keystrokes("end shift-left");
+                visual.simulate_input("3");
+                assert_value(visual, "Exited_3");
+                visual.simulate_keystrokes("ctrl-home shift-end ctrl-insert shift-delete");
+                assert_value(visual, "");
+                visual.simulate_keystrokes("shift-insert");
+                assert_value(visual, "Exited_3");
+                // Opening and dismissing the standard edit menu keeps the field usable.
+                let bounds = visual.debug_bounds(id).unwrap();
+                visual.simulate_mouse_down(
+                    bounds.center(),
+                    gpui::MouseButton::Right,
+                    Modifiers::none(),
+                );
+                visual.simulate_mouse_up(
+                    bounds.center(),
+                    gpui::MouseButton::Right,
+                    Modifiers::none(),
+                );
+                visual.simulate_keystrokes("escape ctrl-a ctrl-c");
+                visual.update(|_, cx| {
+                    assert_eq!(
+                        cx.read_from_clipboard().unwrap().text().unwrap(),
+                        "Exited_3"
+                    )
+                });
+                if id == "nickname" {
+                    for invalid in ["abcdefghijklmnopq", "Spaces are bad", "РусскийНик"] {
+                        visual.simulate_keystrokes("ctrl-a");
+                        visual.update(|_, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(invalid.into()))
+                        });
+                        visual.simulate_keystrokes("ctrl-v");
+                        assert_value(visual, "Exited_3");
+                    }
+                } else {
+                    visual.simulate_keystrokes("ctrl-a");
+                    visual.update(|_, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                            "C:\\First Second".into(),
+                        ))
+                    });
+                    visual.simulate_keystrokes("ctrl-v end ctrl-shift-left ctrl-c");
+                    visual.update(|_, cx| {
+                        assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "Second")
+                    });
+                    visual.simulate_keystrokes("right ctrl-backspace");
+                    assert_value(visual, "C:\\First ");
+                }
+            }
         }
     }
 
@@ -1685,30 +2274,21 @@ mod tests {
             };
             let initial = plan(game.path(), &release, release.choices(None), true).unwrap();
             apply(game.path(), &initial, false, Some(cache.path()), |_| {}).unwrap();
-            let (view, visual) = cx.add_window_view(|_, cx| {
-                let mut wizard = Wizard {
-                    prefs: Preferences {
-                        language: language.into(),
-                        game: Some(game.path().into()),
-                        nickname: "TestPlayer".into(),
-                        use_local_release: true,
-                        ..Default::default()
-                    },
-                    step: Step::Ready,
-                    release: Some(release.clone()),
-                    plan: None,
-                    choices: BTreeMap::new(),
-                    recommended: true,
-                    replace: false,
-                    error: String::new(),
-                    progress: Arc::default(),
-                    focus: cx.focus_handle(),
-                    request_copied: false,
-                    feedback: None,
-                    advanced: false,
-                    app_update: None,
-                    folder_return: None,
+            let (view, visual) = add_wizard_window(cx, |window, cx| {
+                let mut wizard = Wizard::new(window, cx);
+                wizard.prefs = Preferences {
+                    language: language.into(),
+                    game: Some(game.path().into()),
+                    nickname: "TestPlayer".into(),
+                    use_local_release: true,
+                    ..Default::default()
                 };
+                wizard
+                    .nickname
+                    .update(cx, |input, cx| input.set_value("TestPlayer", window, cx));
+                wizard.set_input_placeholders(window, cx);
+                wizard.step = Step::Ready;
+                wizard.release = Some(release.clone());
                 wizard.make_plan().unwrap();
                 wizard
             });
@@ -1742,15 +2322,23 @@ mod tests {
             .unwrap();
             apply(other.path(), &other_plan, false, Some(cache.path()), |_| {}).unwrap();
             let original_receipt = fs::read(game.path().join(".forever-smp/state.json")).unwrap();
-            view.update(visual, |wizard, cx| {
-                wizard.select_game_folder(other.path().into()).unwrap();
-                assert!(wizard.step == Step::Ready);
-                assert!(!wizard.choices["camera-overhaul"]);
-                wizard.select_game_folder(game.path().into()).unwrap();
-                assert!(wizard.step == Step::Ready);
-                assert!(wizard.choices["camera-overhaul"]);
-                cx.notify();
-            });
+            for (folder, enabled) in [(other.path(), false), (game.path(), true)] {
+                visual.update(|window, cx| {
+                    view.update(cx, |wizard, cx| {
+                        wizard.open_folder(window, cx);
+                        wizard.folder_path.update(cx, |input, cx| {
+                            input.set_value(folder.display().to_string(), window, cx)
+                        });
+                        wizard.use_game_folder(cx);
+                        assert_eq!(wizard.step, Step::Busy);
+                    });
+                });
+                visual.run_until_parked();
+                view.read_with(visual, |wizard, _| {
+                    assert_eq!(wizard.step, Step::Ready);
+                    assert_eq!(wizard.choices["camera-overhaul"], enabled);
+                });
+            }
             assert_eq!(
                 fs::read(game.path().join(".forever-smp/state.json")).unwrap(),
                 original_receipt
@@ -1759,6 +2347,14 @@ mod tests {
             visual.simulate_click(bounds.center(), Modifiers::none());
             assert!(view.read_with(visual, |wizard, _| wizard.step == Step::Options));
             let saved_state = fs::read(game.path().join(".forever-smp/state.json")).unwrap();
+            let feature = visual.debug_bounds("feature-0").unwrap();
+            let done = visual.debug_bounds("options-done").unwrap();
+            assert_eq!(feature.size.width, done.size.width);
+            visual.simulate_keystrokes("tab");
+            activate_focused(visual, "space");
+            assert!(!view.read_with(visual, |wizard, _| wizard.choices["camera-overhaul"]));
+            activate_focused(visual, "enter");
+            assert!(view.read_with(visual, |wizard, _| wizard.choices["camera-overhaul"]));
             let bounds = visual.debug_bounds("options-done").unwrap();
             visual.simulate_click(bounds.center(), Modifiers::none());
             assert!(view.read_with(visual, |wizard, _| wizard.step == Step::Ready));
@@ -1824,7 +2420,7 @@ mod tests {
             fs::write(&recipe_path, serde_json::to_vec(&release).unwrap()).unwrap();
             view.update(visual, |wizard, cx| {
                 wizard.prefs.recipe = Some(recipe_path.clone());
-                wizard.after_source().unwrap();
+                wizard.after_source(Some(prepare_game_folder(game.path(), &release).unwrap()));
                 cx.notify();
             });
             visual.run_until_parked();
@@ -1841,7 +2437,11 @@ mod tests {
             // A successfully fetched online release uses the same result handler.
             view.update(visual, |wizard, _| {
                 wizard.prefs.use_local_release = false;
-                wizard.finish_check(release.clone(), true).unwrap();
+                wizard.finish_check(
+                    release.clone(),
+                    true,
+                    Some(prepare_game_folder(game.path(), &release).unwrap()),
+                );
             });
             assert!(view.read_with(visual, |wizard, _| wizard.step == Step::CheckResult));
             let feedback = view.read_with(visual, |wizard, _| wizard.feedback.clone().unwrap());
@@ -1916,7 +2516,11 @@ mod tests {
                     },
                     envelope: vec![], // Rendering fixture; never used for staging.
                 });
-                wizard.finish_check(combined.clone(), true).unwrap();
+                wizard.finish_check(
+                    combined.clone(),
+                    true,
+                    Some(prepare_game_folder(game.path(), &combined).unwrap()),
+                );
                 cx.notify();
             });
             visual.run_until_parked();
@@ -2022,7 +2626,11 @@ mod tests {
             additions.mods[0].sha512 = sha512(b"new camera");
             additions.mods[0].size = 10;
             view.update(visual, |wizard, cx| {
-                wizard.finish_check(additions.clone(), true).unwrap();
+                wizard.finish_check(
+                    additions.clone(),
+                    true,
+                    Some(prepare_game_folder(game.path(), &additions).unwrap()),
+                );
                 assert!(!wizard.choices["camera-overhaul"]);
                 assert!(wizard.choices["new-social"]);
                 assert!(!wizard.choices["experimental"]);
@@ -2044,7 +2652,11 @@ mod tests {
             assert_eq!(approved.install.len(), 2);
             apply(game.path(), &approved, false, Some(cache.path()), |_| {}).unwrap();
             view.update(visual, |wizard, cx| {
-                wizard.finish_check(additions.clone(), true).unwrap();
+                wizard.finish_check(
+                    additions.clone(),
+                    true,
+                    Some(prepare_game_folder(game.path(), &additions).unwrap()),
+                );
                 cx.notify();
             });
             visual.run_until_parked();
@@ -2072,7 +2684,11 @@ mod tests {
                 .mods
                 .retain(|m| m.feature.as_deref() != Some("new-social"));
             view.update(visual, |wizard, cx| {
-                wizard.finish_check(retired.clone(), true).unwrap();
+                wizard.finish_check(
+                    retired.clone(),
+                    true,
+                    Some(prepare_game_folder(game.path(), &retired).unwrap()),
+                );
                 cx.notify();
             });
             let retirement = view.read_with(visual, |wizard, _| {
